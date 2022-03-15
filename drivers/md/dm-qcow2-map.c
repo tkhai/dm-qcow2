@@ -6,6 +6,7 @@
 #include <linux/uio.h>
 #include <linux/fs.h>
 #include <uapi/linux/falloc.h>
+#include <linux/blk-cgroup.h>
 #include <linux/blk-mq.h>
 #include <linux/zlib.h>
 
@@ -335,6 +336,7 @@ void init_qio(struct qio *qio, unsigned int bi_op, struct qcow2 *qcow2)
 	qio->flags = 0;
 	qio->ref_index = REF_INDEX_INVALID;
 	atomic_set(&qio->remaining, 1);
+	qio->css = NULL;
 
 	/*
 	 * Initially set into BLK_STS_OK, while aio complete,
@@ -481,6 +483,7 @@ static struct qio *split_and_chain_qio(struct qcow2 *qcow2,
 		return NULL;
 
 	init_qio(split, qio->bi_op, qcow2);
+	split->css = qio->css;
 	split->queue_list_id = qio->queue_list_id;
 	split->flags |= QIO_FREE_ON_ENDIO_FL;
 	split->flags |= (qio->flags & QIO_SPLIT_INHERITED_FLAGS);
@@ -810,7 +813,8 @@ err:
 
 static struct qio *alloc_qio_with_qvec(struct qcow2 *qcow2, u32 nr_pages,
 				       unsigned int bi_op, bool wants_pages,
-				       struct qcow2_bvec **qvec)
+				       struct qcow2_bvec **qvec,
+				       struct cgroup_subsys_state *css)
 {
 	struct qcow2_target *tgt = qcow2->tgt;
 	struct qio *qio;
@@ -818,6 +822,7 @@ static struct qio *alloc_qio_with_qvec(struct qcow2 *qcow2, u32 nr_pages,
 	qio = alloc_qio(tgt->qio_pool, true);
 	if (!qio)
 		return NULL;
+	qio->css = css;
 
 	*qvec = alloc_qvec_with_pages(nr_pages, wants_pages);
 	if (!*qvec) {
@@ -1234,6 +1239,7 @@ static void dec_cluster_usage(struct qcow2 *qcow2, struct md_page *r2_md,
 
 static void __submit_rw_mapped(struct qcow2 *qcow2, struct qio *qio, u32 nr_segs)
 {
+	struct cgroup_subsys_state *css = qio->css;
 	struct bio_vec *bvec;
 	struct iov_iter iter;
 	unsigned int rw;
@@ -1246,7 +1252,12 @@ static void __submit_rw_mapped(struct qcow2 *qcow2, struct qio *qio, u32 nr_segs
 	iov_iter_bvec(&iter, rw, bvec, nr_segs, qio->bi_iter.bi_size);
 	iter.iov_offset = qio->bi_iter.bi_bvec_done;
 
+	if (css)
+		kthread_associate_blkcg(css);
+	/* Don't touch @qio after that */
 	call_rw_iter(qcow2, pos, rw, &iter, qio);
+	if (css)
+		kthread_associate_blkcg(NULL);
 }
 
 static void submit_rw_mapped(struct qcow2 *qcow2, struct qio *qio)
@@ -1459,7 +1470,7 @@ static void md_page_write_complete(struct qio *qio)
 }
 
 static void submit_rw_md_page(unsigned int rw, struct qcow2 *qcow2,
-			      struct md_page *md)
+		struct md_page *md, struct cgroup_subsys_state *css)
 {
 	struct qcow2_target *tgt = qcow2->tgt;
 	loff_t pos = md->id << PAGE_SHIFT;
@@ -1481,7 +1492,7 @@ static void submit_rw_md_page(unsigned int rw, struct qcow2 *qcow2,
 		 * Note, this is fake qio, and qio_endio()
 		 * can't be called on it!
 		 */
-		qio = alloc_qio_with_qvec(qcow2, 1, bi_op, false, &qvec);
+		qio = alloc_qio_with_qvec(qcow2, 1, bi_op, false, &qvec, css);
 		if (!qio || alloc_qio_ext(qio)) {
 			if (qio)
 				free_qio(qio, tgt->qio_pool);
@@ -1522,6 +1533,7 @@ static void submit_rw_md_page(unsigned int rw, struct qcow2 *qcow2,
 static int submit_read_md_page(struct qcow2 *qcow2, struct qio **qio,
 			       u64 page_id)
 {
+	struct cgroup_subsys_state *css = (*qio)->css;
 	struct md_page *md;
 	int ret;
 
@@ -1537,7 +1549,7 @@ static int submit_read_md_page(struct qcow2 *qcow2, struct qio **qio,
 	*qio = NULL;
 	spin_unlock_irq(&qcow2->md_pages_lock);
 
-	submit_rw_md_page(READ, qcow2, md);
+	submit_rw_md_page(READ, qcow2, md, css);
 out_lock:
 	spin_lock_irq(&qcow2->md_pages_lock);
 	return ret;
@@ -2695,6 +2707,7 @@ static int prepare_backward_merge(struct qcow2 *qcow2, struct qio **qio,
 		}
 
 		init_qio(aux_qio, REQ_OP_WRITE, qcow2);
+		aux_qio->css = (*qio)->css;
 		aux_qio->flags = QIO_IS_MERGE_FL|QIO_FREE_ON_ENDIO_FL;
 		aux_qio->bi_io_vec = (*qio)->bi_io_vec;
 		aux_qio->bi_iter = (*qio)->bi_iter;
@@ -2852,7 +2865,8 @@ static void submit_read_whole_cow_clu(struct qcow2_map *map, struct qio *qio)
 	WARN_ON_ONCE(map->level & L2_LEVEL);
 
 	nr_pages = clu_size >> PAGE_SHIFT;
-	read_qio = alloc_qio_with_qvec(qcow2, nr_pages, REQ_OP_READ, true, &qvec);
+	read_qio = alloc_qio_with_qvec(qcow2, nr_pages, REQ_OP_READ, true,
+				       &qvec, qio->css);
 	if (!read_qio) {
 		qio->bi_status = BLK_STS_RESOURCE;
 		qio_endio(qio); /* Frees ext */
@@ -3056,7 +3070,7 @@ static void submit_read_compressed(struct qcow2_map *map, struct qio *qio,
 	}
 
 	read_qio = alloc_qio_with_qvec(qcow2, nr_alloc, REQ_OP_READ,
-				       true, &qvec);
+				       true, &qvec, qio->css);
 	/* COW may already allocate qio->ext */
 	if (!read_qio || (!qio->ext && alloc_qio_ext(qio) < 0)) {
 		if (read_qio) {
@@ -3184,7 +3198,8 @@ static void submit_read_sliced_clu(struct qcow2_map *map, struct qio *qio,
 		goto out;
 	}
 
-	read_qio = alloc_qio_with_qvec(qcow2, nr_pages, REQ_OP_READ, true, &qvec);
+	read_qio = alloc_qio_with_qvec(qcow2, nr_pages, REQ_OP_READ,
+				       true, &qvec, qio->css);
 	if (!read_qio)
 		goto err_alloc;
 	read_qio->flags |= QIO_FREE_ON_ENDIO_FL;
@@ -3507,7 +3522,9 @@ static void process_deferred_qios(struct qcow2 *qcow2, struct list_head *qios)
 
 static void submit_metadata_writeback(struct qcow2 *qcow2)
 {
+	struct cgroup_subsys_state *css;
 	struct md_page *md;
+	struct qio *qio;
 
 	while (1) {
 		spin_lock_irq(&qcow2->md_pages_lock);
@@ -3525,7 +3542,10 @@ static void submit_metadata_writeback(struct qcow2 *qcow2)
 		md->status &= ~MD_DIRTY;
 		spin_unlock_irq(&qcow2->md_pages_lock);
 
-		submit_rw_md_page(WRITE, qcow2, md);
+		qio = list_first_entry_or_null(&md->wait_list, struct qio, link);
+		css = qio ? qio->css : NULL;
+
+		submit_rw_md_page(WRITE, qcow2, md, css);
 	}
 }
 
@@ -3633,6 +3653,7 @@ static int prepare_sliced_data_write(struct qcow2 *qcow2, struct qio *qio,
 	if (!write_qio)
 		goto err_qio;
 	init_qio(write_qio, REQ_OP_WRITE, qcow2);
+	write_qio->css = qio->css;
 	write_qio->flags |= QIO_FREE_ON_ENDIO_FL;
 	write_qio->endio_cb = endio;
 	write_qio->endio_cb_data = qio;
@@ -3729,6 +3750,7 @@ static void submit_cow_data_write(struct qcow2 *qcow2, struct qio *qio, loff_t p
 		return;
 	}
 	init_qio(write_qio, REQ_OP_WRITE, qcow2);
+	write_qio->css = qio->css;
 
 	write_qio->flags |= QIO_FREE_ON_ENDIO_FL;
 	write_qio->bi_io_vec = qvec->bvec;
@@ -4077,6 +4099,12 @@ static void init_qrq(struct qcow2_rq *qrq, struct request *rq)
 {
 	qrq->rq = rq;
 	qrq->bvec = NULL;
+	qrq->css = NULL;
+#ifdef CONFIG_BLK_CGROUP
+	/* Do not do css_get() here, since rq->bio has already done this */
+	if (rq->bio && rq->bio->bi_blkg)
+		qrq->css = &bio_blkcg(rq->bio)->css;
+#endif
 }
 
 static void init_qrq_and_embedded_qio(struct qcow2_target *tgt, struct request *rq,
@@ -4084,6 +4112,7 @@ static void init_qrq_and_embedded_qio(struct qcow2_target *tgt, struct request *
 {
 	init_qrq(qrq, rq);
 	init_qio(qio, req_op(rq), NULL);
+	qio->css = qrq->css;
 
 	qio->endio_cb = qrq_endio;
 	qio->endio_cb_data = qrq;

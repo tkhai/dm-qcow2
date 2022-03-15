@@ -233,6 +233,7 @@ struct qio_ext {
 struct qcow2_rq {
 	struct request *rq;
 	struct bio_vec *bvec;
+	struct cgroup_subsys_state *css;
 };
 
 struct qio;
@@ -262,6 +263,8 @@ struct qio {
 	u8 queue_list_id:4;
 
 	atomic_t remaining;
+
+	struct cgroup_subsys_state *css;
 
 	struct kiocb iocb;
 	atomic_t aio_ref;
