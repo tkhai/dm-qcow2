@@ -109,18 +109,6 @@ static int qcow2_merge_common(struct qcow2_target *tgt)
 				  REQ_OP_WRITE, QIO_IS_MERGE_FL);
 }
 
-/*
- * Forward merge is a simple COW simulation in every clu.
- * After that, all mapped clus from lower delta become
- * mapped in top delta. Then, userspace may remove lower
- * delta from the deltas stack (and it also has to update
- * backing file name in top delta's metadata).
- */
-static int qcow2_merge_forward(struct qcow2_target *tgt)
-{
-	return -ENOTTY; /* TODO */
-}
-
 static int qcow2_break_l1cow(struct qcow2_target *tgt)
 {
 	struct qcow2 *qcow2 = tgt->top;
@@ -383,8 +371,6 @@ int qcow2_message(struct dm_target *ti, unsigned int argc, char **argv,
 	} else if (!tgt->service_operations_allowed) {
 		ret = -EBUSY; /* Suspended */
 		/* Service operations goes below: */
-	} else if (!strcmp(argv[0], "merge_forward")) {
-		ret = qcow2_merge_forward(tgt);
 	} else if (!strcmp(argv[0], "merge_backward")) {
 		ret = qcow2_merge_backward(tgt);
 	} else {

@@ -1413,7 +1413,7 @@ static void do_md_page_write_complete(int ret, struct qcow2 *qcow2,
 			clear_writeback_status(qcow2, md, ret,
 					       &wait_list, &end_list);
 		}
-		/* FIXME: we should reread md after write fail */
+		/* XXX: should we reread md after write fail? */
 	} else {
 		clear_writeback_status(qcow2, md, ret, &wait_list, &end_list);
 	}
@@ -2233,7 +2233,7 @@ static int relocate_refcount_table(struct qcow2 *qcow2, struct qio **qio)
 	struct md_page *md0, *md;
 	int ret;
 
-	/* FIXME: check there is no in-flight operations */
+	/* XXX: care about parallel in-flight operations */
 	old_clus = qcow2->hdr.refcount_table_clusters;
 	clus = min_t(u32, old_clus + 1, REFCOUNT_TABLE_MAX_SIZE / clu_size);
 	if (clus <= old_clus) {
@@ -3579,7 +3579,7 @@ static int complete_metadata_writeback(struct qcow2 *qcow2)
 		return -EAGAIN;
 
 	fsync_ret = vfs_fsync(qcow2->file, 0);
-	/* FIXME: We should reread md page on error */
+	/* XXX: should we reread md on error? */
 	if (unlikely(fsync_ret))
 		pr_err_ratelimited("qcow2: can't sync md: %d\n", fsync_ret);
 
