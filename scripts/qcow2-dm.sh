@@ -13,12 +13,22 @@ Usage:
 EOF
 }
 
+get_img_size () {
+	sz=`qemu-img info -f qcow2 $1 | grep "virtual size" | sed 's/.*(\(.*\) bytes)/\1/'`
+	echo $sz
+}
+
+get_nr_imgs () {
+	nr=`echo $1 | sed "s/.*qcow2 \(\w\) .*$/\1/"`
+	echo $nr
+}
+
 get_dev_of_image () {
 	abs_path=$1
 
 	while read line; do
 		dev=`echo $line | sed "s/:.*//"`
-		nr_imgs=`echo $line | sed "s/.*\(\w\)$/\1/"`
+		nr_imgs=$(get_nr_imgs "$line")
 		top_img_id=$((nr_imgs - 1))
 
 		top_img_path=`dmsetup message $dev 0 get_img_name $top_img_id`
@@ -51,7 +61,8 @@ create () {
 
 	qemu-img check $file || exit 1
 
-	disk_sz=`qemu-img info -f qcow2 $file | grep "virtual size" | sed 's/.*(\(.*\) bytes)/\1/'`
+	disk_sz=$(get_img_size "$file")
+	echo disk_sz=$disk_sz
 	if [ -z "$disk_sz" ]; then
 		echo "Can't get disk size."; exit 1;
 	fi
@@ -75,6 +86,32 @@ create () {
 
 	echo "Create device [$dev] of size $disk_sz from [${files[*]}]."
 	dmsetup create $dev --table "0 $((disk_sz / 512)) qcow2 ${fds}"
+}
+
+reload_device () {
+	disk_sz=$(get_img_size "$abs_path")
+	if [ -z "$disk_sz" ]; then
+		echo "Can't get disk size."; return;
+	fi
+
+	line=`dmsetup table $dev`
+	nr_imgs=$(get_nr_imgs "$line")
+	top_img_id=$((nr_imgs - 1))
+	fds=""
+
+	for id in `seq 0 $top_img_id`;
+	do
+		file=`dmsetup message $dev 0 get_img_name $id`
+		if [ -z "$file" ]; then
+			echo "Can't get image file."; return;
+		fi
+		exec {fd}<>$file || exit 1
+
+		fds="$fds $fd"
+	done
+
+	echo "Reloading $dev."
+	dmsetup reload $dev --table "0 $((disk_sz / 512)) qcow2 ${fds}"
 }
 
 remove () {
@@ -101,8 +138,13 @@ remove () {
 	exit $ret
 }
 
-qemu_img ()
-{
+qemu_img () {
+	wants_reload=0
+	if [ $1 == "--wants_reload" ]; then
+		wants_reload=1
+		shift
+	fi
+
 	if [ "$#" -lt 3 ]; then
 		echo >&2 "Wrong number of arguments."; usage; exit 1;
 	fi
@@ -117,7 +159,7 @@ qemu_img ()
 		echo >&2 "Can't find device by [$user_path]."; return 1
 	fi
 
-	echo "Suspending $dev"
+	echo "Suspending $dev."
 	dmsetup suspend $dev || exit 1
 
 	if [ "$cmd" != "check" ]; then
@@ -125,7 +167,7 @@ qemu_img ()
 		qemu-img check $abs_path
 		ret=$?
 		if [ $ret -ne 0 ]; then
-			echo "Resume $dev."
+			echo "Resuming $dev."
 			dmsetup resume $dev
 			exit 1
 		fi
@@ -139,7 +181,11 @@ qemu_img ()
 	fi
 	echo "===== End of qemu-img $qemu_img_args. ====="
 
-	echo "Resume $dev."
+	if [ $wants_reload -ne 0 ]; then
+		reload_device $dev $abs_path
+	fi
+
+	echo "Resuming $dev."
 	dmsetup resume $dev || exit 1
 	if [ $? -ne 0 ]; then
 		ret=$?
@@ -168,7 +214,7 @@ resize () {
 	user_path=${@:(-2):1}
 	qemu_img_args=$@
 
-	qemu_img $user_path resize $qemu_img_args
+	qemu_img --wants_reload $user_path resize $qemu_img_args
 	return $?
 }
 
